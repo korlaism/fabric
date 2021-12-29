@@ -9,25 +9,28 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/hyperledger/fabric/internal/ledgerutil"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 const (
-	resultFilename = "result.json"
+	compareErrorMessage = "Ledger Compare Error: "
+	outputDirDesc       = "Snapshot comparison json results output directory. Default is the current directory."
+	firstDiffsDesc      = "Maximum number of differences to record in " + ledgerutil.FirstDiffsByHeight +
+		". Requesting a report with many differences may result in a large amount " +
+		"of memory usage. Defaults to 10. If set to 0, will not produce " +
+		ledgerutil.FirstDiffsByHeight + "."
 )
 
 var (
 	app = kingpin.New("ledgerutil", "Ledger Utility Tool")
 
-	compare       = app.Command("compare", "Compare two ledgers via their snapshots.")
+	compare       = app.Command("compare", "Compare channel snapshots from two different peers.")
 	snapshotPath1 = compare.Arg("snapshotPath1", "First ledger snapshot directory.").Required().String()
 	snapshotPath2 = compare.Arg("snapshotPath2", "Second ledger snapshot directory.").Required().String()
-	outputDir     = compare.Flag("outputDir", "Snapshot comparison json results output directory. Default is the current directory.").Short('o').String()
-
-	troubleshoot = app.Command("troubleshoot", "Identify potentially divergent transactions.")
+	outputDir     = compare.Flag("outputDir", outputDirDesc).Short('o').String()
+	firstDiffs    = compare.Flag("firstDiffs", firstDiffsDesc).Short('f').Default("10").Int()
 
 	args = os.Args[1:]
 )
@@ -41,34 +44,30 @@ func main() {
 		return
 	}
 
-	// Determine result json file location
-	var resultFilepath string
-	if outputDir != nil {
-		resultFilepath = *outputDir
-	} else {
-		resultFilepath, err = os.Getwd()
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-	}
-	resultFilepath = filepath.Join(resultFilepath, resultFilename)
-
 	// Command logic
 	switch command {
-
 	case compare.FullCommand():
 
-		count, err := ledgerutil.Compare(*snapshotPath1, *snapshotPath2, resultFilepath)
+		// Determine result json file location
+		if *outputDir == "" {
+			*outputDir, err = os.Getwd()
+			if err != nil {
+				fmt.Printf("%s%s\n", compareErrorMessage, err)
+				return
+			}
+		}
+
+		count, outputDirPath, err := ledgerutil.Compare(*snapshotPath1, *snapshotPath2, *outputDir, *firstDiffs)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Printf("%s%s\n", compareErrorMessage, err)
 			return
 		}
-		fmt.Printf("\nSuccessfully compared snapshots. Result saved to %s. Total differences found: %d\n", resultFilepath, count)
 
-	case troubleshoot.FullCommand():
-
-		fmt.Println("Command TBD")
-
+		fmt.Print("\nSuccessfully compared snapshots. ")
+		if count == -1 {
+			fmt.Println("Both snapshot public state and private state hashes were the same. No results were generated.")
+		} else {
+			fmt.Printf("Results saved to %s. Total differences found: %d\n", outputDirPath, count)
+		}
 	}
 }

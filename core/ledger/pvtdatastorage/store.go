@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bits-and-blooms/bitset"
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric-protos-go/ledger/rwset"
 	"github.com/hyperledger/fabric/common/flogging"
@@ -19,7 +20,6 @@ import (
 	"github.com/hyperledger/fabric/core/ledger/confighistory"
 	"github.com/hyperledger/fabric/core/ledger/pvtdatapolicy"
 	"github.com/pkg/errors"
-	"github.com/willf/bitset"
 )
 
 var logger = flogging.MustGetLogger("pvtdatastorage")
@@ -112,6 +112,12 @@ type bootKVHashesKey struct {
 	txNum  uint64
 	ns     string
 	coll   string
+}
+
+type hashedIndexKey struct {
+	ns, coll      string
+	pvtkeyHash    []byte
+	blkNum, txNum uint64
 }
 
 type storeEntries struct {
@@ -549,7 +555,7 @@ func (s *Store) getMissingData(group []byte, maxBlock int) (ledger.MissingPvtDat
 }
 
 // FetchBootKVHashes returns the KVHashes from the data that was loaded from a snapshot at the time of
-// bootstrapping. This funciton returns an error if the supplied blkNum is greater than the last block
+// bootstrapping. This function returns an error if the supplied blkNum is greater than the last block
 // number in the booting snapshot
 func (s *Store) FetchBootKVHashes(blkNum, txNum uint64, ns, coll string) (map[string][]byte, error) {
 	if s.bootsnapshotInfo.createdFromSnapshot && blkNum > s.bootsnapshotInfo.lastBlockInSnapshot {

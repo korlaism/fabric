@@ -9,6 +9,7 @@ package gateway
 import (
 	"bytes"
 	"fmt"
+	"math/rand"
 	"sort"
 	"strings"
 	"sync"
@@ -17,29 +18,30 @@ import (
 	dp "github.com/hyperledger/fabric-protos-go/discovery"
 	"github.com/hyperledger/fabric-protos-go/gossip"
 	"github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/flogging"
 	gossipapi "github.com/hyperledger/fabric/gossip/api"
-	"github.com/hyperledger/fabric/gossip/common"
+	gossipcommon "github.com/hyperledger/fabric/gossip/common"
 	gossipdiscovery "github.com/hyperledger/fabric/gossip/discovery"
 )
 
 type Discovery interface {
 	Config(channel string) (*dp.ConfigResult, error)
 	IdentityInfo() gossipapi.PeerIdentitySet
-	PeersForEndorsement(channel common.ChannelID, interest *peer.ChaincodeInterest) (*dp.EndorsementDescriptor, error)
-	PeersOfChannel(common.ChannelID) gossipdiscovery.Members
+	PeersForEndorsement(channel gossipcommon.ChannelID, interest *peer.ChaincodeInterest) (*dp.EndorsementDescriptor, error)
+	PeersOfChannel(gossipcommon.ChannelID) gossipdiscovery.Members
 }
 
 type registry struct {
-	localEndorser       *endorser
-	discovery           Discovery
-	logger              *flogging.FabricLogger
-	endpointFactory     *endpointFactory
-	remoteEndorsers     map[string]*endorser
-	broadcastClients    map[string]*orderer
-	tlsRootCerts        map[string][][]byte
-	channelsInitialized map[string]bool
-	configLock          sync.RWMutex
+	localEndorser      *endorser
+	discovery          Discovery
+	logger             *flogging.FabricLogger
+	endpointFactory    *endpointFactory
+	remoteEndorsers    map[string]*endorser
+	broadcastClients   sync.Map // orderer address (string) -> client connection (orderer)
+	channelInitialized map[string]bool
+	configLock         sync.RWMutex
+	channelOrderers    sync.Map // channel (string) -> orderer addresses (endpointConfig)
 }
 
 type endorserState struct {
@@ -48,141 +50,140 @@ type endorserState struct {
 	height   uint64
 }
 
-// Returns a set of endorsers that satisfies the endorsement plan for the given chaincode on a channel.
-func (reg *registry) endorsers(channel string, chaincode string) ([]*endorser, error) {
-	err := reg.registerChannel(channel)
+// Returns an endorsementPlan for the given chaincode on a channel.
+func (reg *registry) endorsementPlan(channel string, interest *peer.ChaincodeInterest, preferredEndorser *endorser) (*plan, error) {
+	descriptor, err := reg.discovery.PeersForEndorsement(gossipcommon.ChannelID(channel), interest)
 	if err != nil {
-		return nil, err
+		logger.Errorw("PeersForEndorsement failed.", "error", err, "channel", channel, "ChaincodeInterest", proto.MarshalTextString(interest))
+		return nil, fmt.Errorf("no combination of peers can be derived which satisfy the endorsement policy: %s", err)
 	}
 
-	var endorsers []*endorser
+	// There are two parts to an endorsement plan:
+	// 1) List of endorsers in each group
+	// 2) Layouts consisting of a number of endorsers from each group
 
-	interest := &peer.ChaincodeInterest{
-		Chaincodes: []*peer.ChaincodeCall{{
-			Name: chaincode,
-		}},
-	}
+	// Firstly, process the endorsers by group
+	// Create a map of groupIds to list of endorsers, sorted by decreasing block height
+	// Also build a map of endorser pkiid to groupId
+	groupEndorsers := map[string][]*endorser{}
+	var preferredGroup string
+	var unavailableEndorsers []string
 
-	descriptor, err := reg.discovery.PeersForEndorsement(common.ChannelID(channel), interest)
-	if err != nil {
-		return nil, err
-	}
-
-	reg.configLock.RLock()
-	defer reg.configLock.RUnlock()
-
-	for _, layout := range descriptor.GetLayouts() {
-		var receivers []*endorserState // The set of peers the client needs to request endorsements from
-		abandonLayout := false
-		for group, quantity := range layout.GetQuantitiesByGroup() {
-			// Select n remoteEndorsers from each group sorted by block height
-
-			// block heights
-			var groupPeers []*endorserState
-			for _, peer := range descriptor.GetEndorsersByGroups()[group].GetPeers() {
-				msg := &gossip.GossipMessage{}
-				err := proto.Unmarshal(peer.GetStateInfo().GetPayload(), msg)
-				if err != nil {
-					return nil, err
-				}
-
-				height := msg.GetStateInfo().GetProperties().GetLedgerHeight()
-				err = proto.Unmarshal(peer.GetMembershipInfo().GetPayload(), msg)
-				if err != nil {
-					return nil, err
-				}
-				endpoint := msg.GetAliveMsg().GetMembership().GetEndpoint()
-
-				// find the endorser in the registry for this endpoint
-				var endorser *endorser
-				if endpoint == reg.localEndorser.address {
-					endorser = reg.localEndorser
-				} else if e, ok := reg.remoteEndorsers[endpoint]; ok {
-					endorser = e
-				} else {
-					reg.logger.Warnf("Failed to find endorser at %s", endpoint)
-					continue
-				}
-
-				groupPeers = append(groupPeers, &endorserState{peer: peer, endorser: endorser, height: height})
+	for group, peers := range descriptor.GetEndorsersByGroups() {
+		var groupPeers []*endorserState
+		for _, peer := range peers.GetPeers() {
+			// extract block height
+			msg := &gossip.GossipMessage{}
+			err = proto.Unmarshal(peer.GetStateInfo().GetPayload(), msg)
+			if err != nil {
+				return nil, err
 			}
+			height := msg.GetStateInfo().GetProperties().GetLedgerHeight()
 
-			// If the number of available endorsers less than the quantity required, try the next layout
-			if len(groupPeers) < int(quantity) {
-				abandonLayout = true
-				break
+			// extract endpoint
+			err = proto.Unmarshal(peer.GetMembershipInfo().GetPayload(), msg)
+			if err != nil {
+				return nil, err
 			}
+			member := msg.GetAliveMsg().GetMembership()
 
-			// sort by decreasing height
-			sort.Slice(groupPeers, sorter(groupPeers, reg.localEndorser.address))
-
-			receivers = append(receivers, groupPeers[0:quantity]...)
+			// find the endorser in the registry for this endpoint
+			endorser := reg.lookupEndorser(member.GetEndpoint(), member.GetPkiId(), channel)
+			if endorser == nil {
+				unavailableEndorsers = append(unavailableEndorsers, member.GetEndpoint())
+				continue
+			}
+			if endorser == preferredEndorser {
+				preferredGroup = group
+			}
+			groupPeers = append(groupPeers, &endorserState{peer: peer, endorser: endorser, height: height})
 		}
+		// sort by decreasing height
+		sort.Slice(groupPeers, sorter(groupPeers, reg.localEndorser.address))
 
-		if abandonLayout {
-			// try the next layout
-			continue
+		if len(groupPeers) > 0 {
+			var endorsers []*endorser
+			for _, peer := range groupPeers {
+				endorsers = append(endorsers, peer.endorser)
+			}
+			groupEndorsers[group] = endorsers
 		}
-
-		for _, peer := range receivers {
-			endorsers = append(endorsers, peer.endorser)
-		}
-		return endorsers, nil
 	}
 
-	return nil, fmt.Errorf("failed to select a set of endorsers that satisfy the endorsement policy")
+	// Second, process the layouts
+	// Group them by groupId and arrange them so that layouts containing the 'preferredOrg' are at the front of the list
+	var preferredLayouts []*layout
+	var otherLayouts []*layout
+layout:
+	for _, lo := range descriptor.GetLayouts() {
+		hasPreferredGroup := false
+		quantityByGroup := map[string]int{}
+		for group, quantity := range lo.GetQuantitiesByGroup() {
+			// if there's no entry in this map, meaning there aren't any available endorsers for this group
+			if len(groupEndorsers[group]) < int(quantity) {
+				// The number of available endorsers less than the quantity required, so abandon this layout
+				continue layout
+			}
+			quantityByGroup[group] = int(quantity)
+			if group == preferredGroup {
+				hasPreferredGroup = true
+			}
+		}
+		if len(quantityByGroup) == 0 {
+			// empty layout
+			break
+		}
+		if hasPreferredGroup {
+			preferredLayouts = append(preferredLayouts, &layout{required: quantityByGroup})
+		} else {
+			otherLayouts = append(otherLayouts, &layout{required: quantityByGroup})
+		}
+	}
+
+	// shuffle the layouts - keep the preferred ones first
+	rand.Shuffle(len(preferredLayouts), func(i, j int) { preferredLayouts[i], preferredLayouts[j] = preferredLayouts[j], preferredLayouts[i] })
+	rand.Shuffle(len(otherLayouts), func(i, j int) { otherLayouts[i], otherLayouts[j] = otherLayouts[j], otherLayouts[i] })
+	layouts := append(preferredLayouts, otherLayouts...)
+
+	if len(layouts) == 0 {
+		return nil, fmt.Errorf("failed to select a set of endorsers that satisfy the endorsement policy due to unavailability of peers: %v", unavailableEndorsers)
+	}
+
+	return newPlan(layouts, groupEndorsers), nil
 }
 
-// endorsersForOrgs returns a set of endorsers owned by the given orgs for the given chaincode on a channel.
-func (reg *registry) endorsersForOrgs(channel string, chaincode string, endorsingOrgs []string) ([]*endorser, error) {
-	err := reg.registerChannel(channel)
-	if err != nil {
-		return nil, err
-	}
-
+// planForOrgs generates an endorsement plan with a single layout requiring one peer from each of the given orgs for the given chaincode on a channel.
+func (reg *registry) planForOrgs(channel string, chaincode string, endorsingOrgs []string) (*plan, error) {
 	endorsersByOrg := reg.endorsersByOrg(channel, chaincode)
 
-	var endorsers []*endorser
+	required := map[string]int{}
+	groupEndorsers := map[string][]*endorser{}
 	missingOrgs := []string{}
-	for _, required := range endorsingOrgs {
-		if e, ok := endorsersByOrg[required]; ok {
-			endorsers = append(endorsers, e[0].endorser)
+	for _, org := range endorsingOrgs {
+		if es, ok := endorsersByOrg[org]; ok {
+			for _, e := range es {
+				groupEndorsers[org] = append(groupEndorsers[org], e.endorser)
+			}
+			required[org] = 1
 		} else {
-			missingOrgs = append(missingOrgs, required)
+			missingOrgs = append(missingOrgs, org)
 		}
 	}
 	if len(missingOrgs) > 0 {
 		return nil, fmt.Errorf("failed to find any endorsing peers for org(s): %s", strings.Join(missingOrgs, ", "))
 	}
 
-	return endorsers, nil
+	return newPlan([]*layout{{required: required}}, groupEndorsers), nil
 }
 
 func (reg *registry) endorsersByOrg(channel string, chaincode string) map[string][]*endorserState {
 	endorsersByOrg := make(map[string][]*endorserState)
 
-	members := reg.discovery.PeersOfChannel(common.ChannelID(channel))
-
-	reg.configLock.RLock()
-	defer reg.configLock.RUnlock()
+	members := reg.discovery.PeersOfChannel(gossipcommon.ChannelID(channel))
 
 	for _, member := range members {
-		pkiid := member.PKIid
-		endpoint := member.PreferredEndpoint()
-
-		// find the endorser in the registry for this endpoint
-		var endorser *endorser
-		if bytes.Equal(pkiid, reg.localEndorser.pkiid) {
-			logger.Debugw("Found local endorser", "pkiid", pkiid)
-			endorser = reg.localEndorser
-		} else if endpoint == "" {
-			reg.logger.Warnf("No endpoint for endorser with PKI ID %s", pkiid.String())
-			continue
-		} else if e, ok := reg.remoteEndorsers[endpoint]; ok {
-			logger.Debugw("Found remote endorser", "endpoint", endpoint)
-			endorser = e
-		} else {
-			reg.logger.Warnf("Failed to find endorser at %s", endpoint)
+		endorser := reg.lookupEndorser(member.PreferredEndpoint(), member.PKIid, channel)
+		if endorser == nil {
 			continue
 		}
 		for _, installedChaincode := range member.Properties.GetChaincodes() {
@@ -199,38 +200,42 @@ func (reg *registry) endorsersByOrg(channel string, chaincode string) map[string
 	return endorsersByOrg
 }
 
-// evaluator returns a single endorser, preferably from local org, if available
+// evaluator returns a plan representing a single endorsement, preferably from local org, if available
 // targetOrgs specifies the orgs that are allowed receive the request, due to private data restrictions
-func (reg *registry) evaluator(channel string, chaincode string, targetOrgs []string) (*endorser, error) {
-	err := reg.registerChannel(channel)
-	if err != nil {
-		return nil, err
-	}
-
+func (reg *registry) evaluator(channel string, chaincode string, targetOrgs []string) (*plan, error) {
 	endorsersByOrg := reg.endorsersByOrg(channel, chaincode)
+
 	// If no targetOrgs are specified (i.e. no restrictions), then populate with all available orgs
 	if len(targetOrgs) == 0 {
 		for org := range endorsersByOrg {
 			targetOrgs = append(targetOrgs, org)
 		}
 	}
-	// Prefer a local org endorser, if present
-	if e, ok := endorsersByOrg[reg.localEndorser.mspid]; ok && contains(targetOrgs, reg.localEndorser.mspid) {
-		return e[0].endorser, nil
-	}
-	// Otherwise highest block height peer (first in list) from another org
-	var evaluator *endorser
-	var maxHeight uint64
+
+	localOrgEndorsers := []*endorserState{}
+	otherOrgEndorsers := []*endorserState{}
 	for _, org := range targetOrgs {
-		if e, ok := endorsersByOrg[org]; ok && e[0].height > maxHeight {
-			evaluator = e[0].endorser
-			maxHeight = e[0].height
+		if es, ok := endorsersByOrg[org]; ok {
+			if org == reg.localEndorser.mspid {
+				localOrgEndorsers = es
+			} else {
+				otherOrgEndorsers = append(otherOrgEndorsers, es...)
+			}
 		}
 	}
-	if evaluator != nil {
-		return evaluator, nil
+	// sort all the 'other orgs' endorsers by decreasing block height
+	sort.Slice(otherOrgEndorsers, sorter(otherOrgEndorsers, ""))
+
+	var allEndorsers []*endorser
+	for _, e := range append(localOrgEndorsers, otherOrgEndorsers...) {
+		allEndorsers = append(allEndorsers, e.endorser)
 	}
-	return nil, fmt.Errorf("no endorsing peers found for channel: %s", channel)
+	if len(allEndorsers) > 0 {
+		layout := []*layout{{required: map[string]int{"g1": 1}}} // single layout, one group, one endorsement
+		groupEndorsers := map[string][]*endorser{"g1": allEndorsers}
+		return newPlan(layout, groupEndorsers), nil
+	}
+	return nil, fmt.Errorf("no peers available to evaluate chaincode %s in channel %s", chaincode, channel)
 }
 
 func sorter(e []*endorserState, host string) func(i, j int) bool {
@@ -243,95 +248,119 @@ func sorter(e []*endorserState, host string) func(i, j int) bool {
 	}
 }
 
-func contains(slice []string, entry string) bool {
-	for _, item := range slice {
-		if entry == item {
-			return true
-		}
-	}
-	return false
-}
-
 // Returns a set of broadcastClients that can order a transaction for the given channel.
 func (reg *registry) orderers(channel string) ([]*orderer, error) {
-	err := reg.registerChannel(channel)
-	if err != nil {
-		return nil, err
-	}
 	var orderers []*orderer
-
-	// Get the config
-	config, err := reg.discovery.Config(channel)
-	if err != nil {
-		return nil, err
+	var ordererEndpoints []*endpointConfig
+	addr, exists := reg.channelOrderers.Load(channel)
+	// if it doesn't exist, get the orderers config for this channel
+	if exists {
+		ordererEndpoints = addr.([]*endpointConfig)
+	} else {
+		// no entry in the map - get the orderer config from discovery
+		channelOrderers, err := reg.config(channel)
+		if err != nil {
+			return nil, err
+		}
+		// A config update may have saved this first, in which case don't overwrite it.
+		addr, _ = reg.channelOrderers.LoadOrStore(channel, channelOrderers)
+		ordererEndpoints = addr.([]*endpointConfig)
 	}
-
-	reg.configLock.RLock()
-	defer reg.configLock.RUnlock()
-
-	for _, eps := range config.GetOrderers() {
-		for _, ep := range eps.Endpoint {
-			url := fmt.Sprintf("%s:%d", ep.Host, ep.Port)
-			if ord, ok := reg.broadcastClients[url]; ok {
-				orderers = append(orderers, ord)
+	for _, ep := range ordererEndpoints {
+		entry, exists := reg.broadcastClients.Load(ep.address)
+		if !exists {
+			// this orderer is new - connect to it and add to the broadcastClients registry
+			client, err := reg.endpointFactory.newOrderer(ep.address, ep.mspid, ep.tlsRootCerts)
+			if err != nil {
+				// Failed to connect to this orderer for some reason.  Log the problem and skip to the next one.
+				reg.logger.Warnw("Failed to connect to orderer", "address", ep.address, "err", err)
+				continue
+			}
+			var loaded bool
+			entry, loaded = reg.broadcastClients.LoadOrStore(ep.address, client)
+			if loaded {
+				// another goroutine got there first, close this new connection
+				err = client.closeConnection()
+				if err != nil {
+					// Failed to close this new connection.  Log the problem.
+					reg.logger.Warnw("Failed to close connection to orderer", "address", ep.address, "err", err)
+				}
+			} else {
+				reg.logger.Infow("Added orderer to registry", "address", ep.address)
 			}
 		}
+		orderers = append(orderers, entry.(*orderer))
 	}
 
 	return orderers, nil
 }
 
-func (reg *registry) registerChannel(channel string) error {
-	// todo need to handle membership updates
+func (reg *registry) lookupEndorser(endpoint string, pkiid gossipcommon.PKIidType, channel string) *endorser {
+	lookup := func() (*endorser, bool) {
+		reg.configLock.RLock()
+		defer reg.configLock.RUnlock()
+
+		// find the endorser in the registry for this endpoint
+		if bytes.Equal(pkiid, reg.localEndorser.pkiid) {
+			logger.Debugw("Found local endorser", "pkiid", pkiid)
+			return reg.localEndorser, false
+		}
+		if endpoint == "" {
+			reg.logger.Warnw("No endpoint for endorser with PKI ID %s", "pkiid", pkiid.String())
+			return nil, false
+		}
+		if e, ok := reg.remoteEndorsers[endpoint]; ok {
+			logger.Debugw("Found remote endorser", "endpoint", endpoint)
+			return e, false
+		}
+		// not found - try to connect
+		return nil, true
+	}
+	endorser, connect := lookup()
+	if connect {
+		reg.logger.Infow("Attempting to connect to endorser", "endpoint", endpoint)
+		// for efficiency, try to connect to all peers in the channel in one pass
+		err := reg.connectChannelPeers(channel, true)
+		if err != nil {
+			logger.Errorw("Failed to reconnect", "endpoint", endpoint, "err", err)
+		}
+		endorser, _ = lookup() // if it failed to reconnect, this will be nil
+	}
+	return endorser
+}
+
+// Connect to peers in channel, and add to the registry.  If a reconnection is required, then it must be removed
+// from the registry first, using removeEndorser().
+func (reg *registry) connectChannelPeers(channel string, force bool) error {
 	reg.configLock.Lock() // take a write lock to populate the registry maps
 	defer reg.configLock.Unlock()
 
-	if reg.channelsInitialized[channel] {
+	if !force && reg.channelInitialized[channel] {
 		return nil
-	}
-	// get config and peer discovery info for this channel
-
-	// Get the config
-	config, err := reg.discovery.Config(channel)
-	if err != nil {
-		return err
-	}
-	// get the tlscerts
-	for msp, info := range config.GetMsps() {
-		reg.tlsRootCerts[msp] = info.GetTlsRootCerts()
-	}
-
-	for mspid, eps := range config.GetOrderers() {
-		for _, ep := range eps.Endpoint {
-			address := fmt.Sprintf("%s:%d", ep.Host, ep.Port)
-			if _, ok := reg.broadcastClients[address]; !ok {
-				// this orderer is new - connect to it and add to the broadcastClients registry
-				tlsRootCerts := reg.tlsRootCerts[mspid]
-				orderer, err := reg.endpointFactory.newOrderer(address, mspid, tlsRootCerts)
-				if err != nil {
-					return err
-				}
-				reg.broadcastClients[address] = orderer
-				reg.logger.Infof("Added orderer to registry: %s", address)
-			}
-		}
 	}
 
 	// get the remoteEndorsers for the channel
 	peers := map[string]string{}
-	members := reg.discovery.PeersOfChannel(common.ChannelID(channel))
+	members := reg.discovery.PeersOfChannel(gossipcommon.ChannelID(channel))
 	for _, member := range members {
-		id := member.PKIid.String() // TODO this is fragile
+		id := member.PKIid.String()
 		peers[id] = member.PreferredEndpoint()
 	}
+	config, err := reg.discovery.Config(channel)
+	if err != nil {
+		return fmt.Errorf("failed to get config for channel [%s]: %w", channel, err)
+	}
 	for mspid, infoset := range reg.discovery.IdentityInfo().ByOrg() {
+		var tlsRootCerts [][]byte
+		if mspInfo, ok := config.GetMsps()[mspid]; ok {
+			tlsRootCerts = mspInfo.GetTlsRootCerts()
+		}
 		for _, info := range infoset {
 			pkiid := info.PKIId
 			if address, ok := peers[pkiid.String()]; ok {
 				// add the peer to the peer map - except the local peer, which seems to have an empty address
 				if _, ok := reg.remoteEndorsers[address]; !ok && len(address) > 0 {
 					// this peer is new - connect to it and add to the remoteEndorsers registry
-					tlsRootCerts := reg.tlsRootCerts[mspid]
 					endorser, err := reg.endpointFactory.newEndorser(pkiid, address, mspid, tlsRootCerts)
 					if err != nil {
 						return err
@@ -342,7 +371,63 @@ func (reg *registry) registerChannel(channel string) error {
 			}
 		}
 	}
-	reg.channelsInitialized[channel] = true
-
+	reg.channelInitialized[channel] = true
 	return nil
+}
+
+// removeEndorser closes the connection and removes from the registry, but if the next call to discovery returns that
+// peer in its plan, then it will attempt to reconnect and add it back. This could happen if the peer had gone down,
+// but the gossip has not notified the discovery service yet.
+func (reg *registry) removeEndorser(endorser *endorser) {
+	if endorser == reg.localEndorser {
+		// nothing to close
+		return
+	}
+	reg.configLock.Lock()
+	defer reg.configLock.Unlock()
+
+	err := endorser.closeConnection()
+	if err != nil {
+		reg.logger.Errorw("Failed to close connection to endorser", "address", endorser.address, "mspid", endorser.mspid, "err", err)
+	}
+	delete(reg.remoteEndorsers, endorser.address)
+}
+
+func (reg *registry) config(channel string) ([]*endpointConfig, error) {
+	config, err := reg.discovery.Config(channel)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get config for channel [%s]: %w", channel, err)
+	}
+	var channelOrderers []*endpointConfig
+	for mspid, eps := range config.GetOrderers() {
+		var tlsRootCerts [][]byte
+		if mspInfo, ok := config.GetMsps()[mspid]; ok {
+			tlsRootCerts = mspInfo.GetTlsRootCerts()
+		}
+		for _, ep := range eps.Endpoint {
+			address := fmt.Sprintf("%s:%d", ep.Host, ep.Port)
+			channelOrderers = append(channelOrderers, &endpointConfig{address: address, mspid: mspid, tlsRootCerts: tlsRootCerts})
+		}
+	}
+	return channelOrderers, nil
+}
+
+func (reg *registry) configUpdate(bundle *channelconfig.Bundle) {
+	if ordererConfig, ok := bundle.OrdererConfig(); ok {
+		// orderer config has changed - process the bundle
+		channel := bundle.ConfigtxValidator().ChannelID()
+		reg.logger.Infow("Updating orderer config", "channel", channel)
+		var channelOrderers []*endpointConfig
+		for _, org := range ordererConfig.Organizations() {
+			mspid := org.MSPID()
+			tlsRootCerts := org.MSP().GetTLSRootCerts()
+			for _, address := range org.Endpoints() {
+				channelOrderers = append(channelOrderers, &endpointConfig{address: address, mspid: mspid, tlsRootCerts: tlsRootCerts})
+				reg.logger.Debugw("Channel orderer", "address", address, "mspid", mspid)
+			}
+		}
+		if len(channelOrderers) > 0 {
+			reg.channelOrderers.Store(channel, channelOrderers)
+		}
+	}
 }

@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/golang/protobuf/proto"
@@ -118,24 +119,38 @@ func TestGetPayloads(t *testing.T) {
 	t.Logf("error6 [%s]", err)
 }
 
-func TestCreateTx(t *testing.T) {
+func TestDeduplicateEndorsements(t *testing.T) {
+	signID := &fakes.SignerSerializer{}
+	signID.SerializeReturns([]byte("signer"), nil)
+	signerBytes, err := signID.Serialize()
+	require.NoError(t, err, "Unexpected error serializing signing identity")
+
 	proposal := &pb.Proposal{
 		Header: protoutil.MarshalOrPanic(&cb.Header{
 			ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
 				Extension: protoutil.MarshalOrPanic(&pb.ChaincodeHeaderExtension{}),
 			}),
+			SignatureHeader: protoutil.MarshalOrPanic(&cb.SignatureHeader{
+				Creator: signerBytes,
+			}),
 		}),
 	}
 	responses := []*pb.ProposalResponse{
-		{Payload: []byte("payload"), Endorsement: &pb.Endorsement{}, Response: &pb.Response{Status: int32(200)}},
+		{Payload: []byte("payload"), Endorsement: &pb.Endorsement{Endorser: []byte{5, 4, 3}}, Response: &pb.Response{Status: int32(200)}},
+		{Payload: []byte("payload"), Endorsement: &pb.Endorsement{Endorser: []byte{5, 4, 3}}, Response: &pb.Response{Status: int32(200)}},
 	}
 
-	unsignedTx, err := protoutil.CreateTx(proposal, responses...)
+	transaction, err := protoutil.CreateSignedTx(proposal, signID, responses...)
 	require.NoError(t, err)
-	signedTx, err := protoutil.CreateSignedTx(proposal, &fakes.SignerSerializer{}, responses...)
-	require.NoError(t, err)
+	require.True(t, proto.Equal(transaction, transaction), "got: %#v, want: %#v", transaction, transaction)
 
-	require.True(t, proto.Equal(signedTx, unsignedTx), "got: %#v, want: %#v", signedTx, unsignedTx)
+	pl := protoutil.UnmarshalPayloadOrPanic(transaction.Payload)
+	tx, err := protoutil.UnmarshalTransaction(pl.Data)
+	require.NoError(t, err)
+	ccap, err := protoutil.UnmarshalChaincodeActionPayload(tx.Actions[0].Payload)
+	require.NoError(t, err)
+	require.Len(t, ccap.Action.Endorsements, 1)
+	require.Equal(t, []byte{5, 4, 3}, ccap.Action.Endorsements[0].Endorser)
 }
 
 func TestCreateSignedTx(t *testing.T) {
@@ -175,14 +190,6 @@ func TestCreateSignedTx(t *testing.T) {
 		responses     []*pb.ProposalResponse
 		expectedError string
 	}{
-		// good responses, but different payloads
-		{
-			[]*pb.ProposalResponse{
-				{Payload: []byte("payload"), Response: &pb.Response{Status: int32(200)}},
-				{Payload: []byte("payload2"), Response: &pb.Response{Status: int32(200)}},
-			},
-			"ProposalResponsePayloads do not match",
-		},
 		// good response followed by bad response
 		{
 			[]*pb.ProposalResponse{
@@ -203,6 +210,16 @@ func TestCreateSignedTx(t *testing.T) {
 	for i, nonMatchingTest := range nonMatchingTests {
 		_, err = protoutil.CreateSignedTx(prop, signID, nonMatchingTest.responses...)
 		require.EqualErrorf(t, err, nonMatchingTest.expectedError, "Expected non-matching response error '%v' for test %d", nonMatchingTest.expectedError, i)
+	}
+
+	// good responses, but different payloads
+	responses = []*pb.ProposalResponse{
+		{Payload: []byte("payload"), Response: &pb.Response{Status: int32(200)}},
+		{Payload: []byte("payload2"), Response: &pb.Response{Status: int32(200)}},
+	}
+	_, err = protoutil.CreateSignedTx(prop, signID, responses...)
+	if err == nil || strings.HasPrefix(err.Error(), "ProposalResponsePayloads do not match (base64):") == false {
+		require.FailNow(t, "Error is expected when response payloads do not match")
 	}
 
 	// no endorsement
@@ -253,7 +270,7 @@ func TestCreateSignedTx(t *testing.T) {
 }
 
 func TestCreateSignedTxNoSigner(t *testing.T) {
-	_, err := protoutil.CreateSignedTx(nil, nil)
+	_, err := protoutil.CreateSignedTx(nil, nil, &pb.ProposalResponse{})
 	require.ErrorContains(t, err, "signer is required when creating a signed transaction")
 }
 

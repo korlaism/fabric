@@ -25,7 +25,6 @@
 #   - docs - builds the documentation in html format
 #   - gotools - installs go tools like golint
 #   - help-docs - generate the command reference docs
-#   - idemixgen - builds a native idemixgen binary
 #   - integration-test-prereqs - setup prerequisites for integration tests
 #   - integration-test - runs the integration tests
 #   - ledgerutil - builds a native ledgerutil binary
@@ -47,7 +46,7 @@
 #   - unit-test - runs the go-test based unit tests
 #   - verify - runs unit tests for only the changed package tree
 
-ALPINE_VER ?= 3.13
+ALPINE_VER ?= 3.14
 BASE_VERSION = 2.4.0
 
 # 3rd party image version
@@ -79,20 +78,19 @@ METADATA_VAR += CommitSHA=$(EXTRA_VERSION)
 METADATA_VAR += BaseDockerLabel=$(BASE_DOCKER_LABEL)
 METADATA_VAR += DockerNamespace=$(DOCKER_NS)
 
-GO_VER = 1.15.7
+GO_VER = 1.16.7
 GO_TAGS ?=
 
 RELEASE_EXES = orderer $(TOOLS_EXES)
 RELEASE_IMAGES = baseos ccenv orderer peer tools
 RELEASE_PLATFORMS = darwin-amd64 linux-amd64 windows-amd64
-TOOLS_EXES = configtxgen configtxlator cryptogen discover idemixgen ledgerutil osnadmin peer
+TOOLS_EXES = configtxgen configtxlator cryptogen discover ledgerutil osnadmin peer
 
 pkgmap.configtxgen    := $(PKGNAME)/cmd/configtxgen
 pkgmap.configtxlator  := $(PKGNAME)/cmd/configtxlator
 pkgmap.cryptogen      := $(PKGNAME)/cmd/cryptogen
 pkgmap.discover       := $(PKGNAME)/cmd/discover
-pkgmap.idemixgen      := $(PKGNAME)/cmd/idemixgen
-pkgmap.ledgerutil		  := $(PKGNAME)/cmd/ledgerutil
+pkgmap.ledgerutil     := $(PKGNAME)/cmd/ledgerutil
 pkgmap.orderer        := $(PKGNAME)/cmd/orderer
 pkgmap.osnadmin       := $(PKGNAME)/cmd/osnadmin
 pkgmap.peer           := $(PKGNAME)/cmd/peer
@@ -150,7 +148,7 @@ integration-test: integration-test-prereqs
 	./scripts/run-integration-tests.sh
 
 .PHONY: integration-test-prereqs
-integration-test-prereqs: gotool.ginkgo baseos-docker ccenv-docker docker-thirdparty
+integration-test-prereqs: gotool.ginkgo baseos-docker ccenv-docker docker-thirdparty ccaasbuilder
 
 .PHONY: unit-test
 unit-test: unit-test-clean docker-thirdparty-couchdb
@@ -267,6 +265,7 @@ release-all: check-go-version $(RELEASE_PLATFORMS:%=release/%)
 .PHONY: $(RELEASE_PLATFORMS:%=release/%)
 $(RELEASE_PLATFORMS:%=release/%): GO_LDFLAGS = $(METADATA_VAR:%=-X $(PKGNAME)/common/metadata.%)
 $(RELEASE_PLATFORMS:%=release/%): release/%: $(foreach exe,$(RELEASE_EXES),release/%/bin/$(exe))
+$(RELEASE_PLATFORMS:%=release/%): ccaasbuilder 
 
 # explicit targets for all platform executables
 $(foreach platform, $(RELEASE_PLATFORMS), $(RELEASE_EXES:%=release/$(platform)/bin/%)):
@@ -282,7 +281,7 @@ dist: dist-clean dist/$(MARCH)
 
 .PHONY: dist-all
 dist-all: dist-clean $(RELEASE_PLATFORMS:%=dist/%)
-dist/%: release/%
+dist/%: release/% ccaasbuilder
 	mkdir -p release/$(@F)/config
 	cp -r sampleconfig/*.yaml release/$(@F)/config
 	cd release/$(@F) && tar -czvf hyperledger-fabric-$(@F).$(PROJECT_VERSION).tar.gz *
@@ -346,3 +345,13 @@ spaces:
 .PHONY: docs
 docs:
 	@docker run --rm -v $$(pwd):/docs n42org/tox:3.4.0 sh -c 'cd /docs && tox -e docs'
+
+.PHONY: ccaasbuilder-clean
+ccaasbuilder-clean:
+	rm -rf $(MARCH:%=release/%)/bin/ccaas_builder
+
+.PHONY: ccaasbuilder
+ccaasbuilder: ccaasbuilder-clean
+	cd ccaas_builder && go test -v ./cmd/detect && go build -o ../$(MARCH:%=release/%)/bin/ccaas_builder/bin/ ./cmd/detect/
+	cd ccaas_builder && go test -v ./cmd/build && go build -o ../$(MARCH:%=release/%)/bin/ccaas_builder/bin/ ./cmd/build/
+	cd ccaas_builder && go test -v ./cmd/release && go build -o ../$(MARCH:%=release/%)/bin/ccaas_builder/bin/ ./cmd/release/

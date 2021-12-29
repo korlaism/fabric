@@ -16,22 +16,26 @@ import (
 	"github.com/hyperledger/fabric/gossip/common"
 	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 )
 
 type endorser struct {
-	client peer.EndorserClient
+	client          peer.EndorserClient
+	closeConnection func() error
 	*endpointConfig
 }
 
 type orderer struct {
-	client ab.AtomicBroadcastClient
+	client          ab.AtomicBroadcastClient
+	closeConnection func() error
 	*endpointConfig
 }
 
 type endpointConfig struct {
-	pkiid   common.PKIidType
-	address string
-	mspid   string
+	pkiid        common.PKIidType
+	address      string
+	mspid        string
+	tlsRootCerts [][]byte
 }
 
 type (
@@ -58,9 +62,17 @@ func (ef *endpointFactory) newEndorser(pkiid common.PKIidType, address, mspid st
 	if connectEndorser == nil {
 		connectEndorser = peer.NewEndorserClient
 	}
+	close := func() error {
+		if conn != nil && conn.GetState() != connectivity.Shutdown {
+			logger.Infow("Closing connection to remote endorser", "address", address, "mspid", mspid)
+			return conn.Close()
+		}
+		return nil
+	}
 	return &endorser{
-		client:         connectEndorser(conn),
-		endpointConfig: &endpointConfig{pkiid: pkiid, address: address, mspid: mspid},
+		client:          connectEndorser(conn),
+		closeConnection: close,
+		endpointConfig:  &endpointConfig{pkiid: pkiid, address: address, mspid: mspid, tlsRootCerts: tlsRootCerts},
 	}, nil
 }
 
@@ -74,8 +86,9 @@ func (ef *endpointFactory) newOrderer(address, mspid string, tlsRootCerts [][]by
 		connectOrderer = ab.NewAtomicBroadcastClient
 	}
 	return &orderer{
-		client:         connectOrderer(conn),
-		endpointConfig: &endpointConfig{address: address, mspid: mspid},
+		client:          connectOrderer(conn),
+		closeConnection: conn.Close,
+		endpointConfig:  &endpointConfig{address: address, mspid: mspid, tlsRootCerts: tlsRootCerts},
 	}, nil
 }
 
